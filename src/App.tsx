@@ -1,0 +1,444 @@
+import {
+  BoxGeometry,
+  Color,
+  Mesh,
+  MeshStandardMaterial,
+  PerspectiveCamera,
+  Scene,
+  Vector3,
+  WebGLRenderer,
+} from "@random-mesh/rmsl/scene";
+import { Component, createEffect, createStore } from "solid-js";
+import { AdaptiveResolution } from "@big-mesh-studios/bms-voxelscape";
+import { DayNightController } from "@big-mesh-studios/bms-voxelscape";
+import { createDebugCommands } from "@big-mesh-studios/bms-voxelscape";
+import {
+  consumeInput,
+  createLookDragHandlers,
+  installKeyboardControls,
+} from "@big-mesh-studios/bms-voxelscape";
+import { GpuTimer } from "@big-mesh-studios/bms-voxelscape";
+import {
+  createPlayer,
+  PLAYER_CFG,
+  updatePlayer,
+} from "@big-mesh-studios/bms-voxelscape";
+import { RendererSwitch } from "@big-mesh-studios/bms-voxelscape";
+import { loadVoxelTiles } from "@big-mesh-studios/bms-voxelscape";
+import { Console } from "@big-mesh-studios/bms-voxelscape";
+import { Controls } from "@big-mesh-studios/bms-voxelscape";
+import { BlockGrid } from "@big-mesh-studios/bms-voxelscape";
+import {
+  BLOCK_WORLD,
+  getWorldHeight,
+  type Dim3,
+} from "@big-mesh-studios/bms-voxelscape";
+import {
+  DEFAULT_TERRAIN,
+  type TerrainConfig,
+} from "@big-mesh-studios/bms-voxelscape";
+import { WorldRing } from "@big-mesh-studios/bms-voxelscape";
+import { DuckMaterial } from "./duck-material";
+import { createOotCamera } from "./camera";
+import { defaultDuckModel } from "./default-duck";
+import { solveVoxels } from "./voxel-solver";
+import { encodePalette, loadModel } from "./load-model";
+import { Dimensions3D } from "./maths";
+import { boxSize } from "./box-size";
+
+const BLOCKS = 5;
+/** Ring half-extent: the farthest the ring's outer edge can be from the player. */
+const RING_RADIUS = (BLOCKS / 2) * BLOCK_WORLD[0];
+/**
+ * Distance at which fog becomes fully opaque and rays stop marching. Set
+ * to the ring edge's closest possible approach to the player — `(BLOCKS/2
+ * - 0.5)` blocks (384) — the distance when the player hugs the far edge
+ * of their center block, so fog always hides the ring boundary before it
+ * can become visible.
+ */
+const FOG_DISTANCE = (BLOCKS / 2 - 0.5) * BLOCK_WORLD[0];
+const FOG_START = 0.4 * FOG_DISTANCE;
+/** Sky blue, matching the material's default fog color so the horizon blends. */
+const SKY_BLUE = 0x87ceeb;
+const SPAWN: Dim3 = [0, 0, 0];
+/**
+ * Distance from the origin beyond which player movement is clamped. The
+ * ring is effectively unbounded, so this exists only to guard against
+ * floating-point drift far outside it.
+ */
+const SAFE_EXTENT = 1e6;
+/** Terrain noise settings shared by every block in the ring. */
+const TERRAIN: TerrainConfig = DEFAULT_TERRAIN;
+/** When true, only surface voxels are written into each block's GPU chunks instead of the full solid volume. */
+const SURFACE_ONLY = true;
+/** Padding added to each mesh's box so adjacent meshes share a thin overlap shell. */
+const PAD = 2.0;
+/** Water absorption used by the raymarch water pass and, at the same value, the triangle renderer's underwater tint. */
+const WATER_EXTINCTION = 0.12;
+/** How many frames between each debug-perf HUD sample (a GPU readback, so throttled). */
+const SAMPLE_EVERY = 24;
+
+let meltyModel = await fetch(/* @vite-ignore */ "./models/melty.zip")
+  .then((r) => r.blob())
+  .then(loadModel);
+
+const App: Component<{}> = () => {
+  /** True when the URL hash includes `perf`, enabling the debug HUD (GPU timer and fetches-per-ray). */
+  const debugPerf =
+    typeof window !== "undefined" && window.location.hash.includes("perf");
+  let [state, setState] = createStore<{
+    canvas: HTMLCanvasElement | undefined;
+    renderer: WebGLRenderer | undefined;
+  }>({
+    canvas: undefined,
+    renderer: undefined,
+  });
+  const scene = new Scene();
+  /**
+   * Owns the sun/ambient lights, the sun/moon billboards, and the day-night
+   * clock. `tick` (called from `animate`) returns the computed day-night
+   * state, which feeds both `rendererSwitch.applyLighting` and the clear
+   * colour below.
+   */
+  const dayNight = new DayNightController({ scene });
+
+  /** A BLOCKS x BLOCKS window of WorldBlocks, tagged with their grid coordinates. */
+  const blockGrid = new BlockGrid({
+    blocksPerSide: BLOCKS,
+    terrain: TERRAIN,
+    surfaceOnly: SURFACE_ONLY,
+  });
+
+  /**
+   * Builds both rendering strategies' meshes for every block above and owns
+   * switching between them (`/renderer ray|tri`).
+   */
+  const rendererSwitch = new RendererSwitch({
+    scene,
+    blocks: blockGrid.blocks,
+    gridCoordAt: (i) => blockGrid.gridCoordAt(i),
+    lookupBlock: (gx, gz) => blockGrid.lookupBlock(gx, gz),
+    padding: PAD,
+    blockWorld: BLOCK_WORLD,
+    fogDistance: FOG_DISTANCE,
+    fogStart: FOG_START,
+    debugPerf,
+    waterExtinction: WATER_EXTINCTION,
+    seaLevel: TERRAIN.seaLevel,
+  });
+
+  /**
+   * Keeps `blockGrid`'s window centred on the player, streamed in off the
+   * main thread as it scrolls.
+   */
+  const worldRing = new WorldRing({
+    blockGrid,
+    terrain: TERRAIN,
+    surfaceOnly: SURFACE_ONLY,
+    onBlockChanged: (i) => rendererSwitch.onBlockChanged(i),
+    onBlockReposition: (i, center) => rendererSwitch.repositionBlock(i, center),
+  });
+
+  const commands = createDebugCommands({ dayNight, rendererSwitch });
+  // Tell every block material which tile each voxel face uses once the
+  // spritesheet loads. Fire-and-forget: voxels stay flat blue until it lands.
+  loadVoxelTiles(rendererSwitch);
+
+  const LIGHT_DIR = new Vector3(0.4, 0.7, 0.8).normalize();
+  const playerMaterial = new DuckMaterial();
+  playerMaterial.lightDir = [LIGHT_DIR.x, LIGHT_DIR.y, LIGHT_DIR.z];
+  playerMaterial.lightColour = [1.0, 0.97, 0.9];
+  playerMaterial.ambientColour = [0.35, 0.35, 0.4];
+  playerMaterial.unlit = false;
+  {
+    const model = meltyModel;
+    const voxels = solveVoxels(model.dimensions, model.sides);
+    const voxelTexture = playerMaterial.voxelTexture;
+    voxelTexture.image = voxels;
+    voxelTexture.width = model.dimensions.width;
+    voxelTexture.height = model.dimensions.height;
+    voxelTexture.depth = model.dimensions.depth;
+    voxelTexture.needsUpdate = true;
+
+    const paletteData = encodePalette(model.palette);
+    const paletteTexture = playerMaterial.paletteTexture;
+    paletteTexture.image = paletteData;
+    paletteTexture.width = model.palette.length;
+    paletteTexture.height = 1;
+    paletteTexture.needsUpdate = true;
+
+    const normalized = Dimensions3D.normalize(model.dimensions);
+    playerMaterial.dimensions = [
+      normalized.width,
+      normalized.height,
+      normalized.depth,
+    ];
+    playerMaterial.voxelCount = [
+      model.dimensions.width,
+      model.dimensions.height,
+      model.dimensions.depth,
+    ];
+
+    const size = boxSize(model.dimensions);
+    PLAYER_CFG.halfSize = 0.5 * size.width;
+    // Half the package default (45) for a slower, more deliberate pace.
+    PLAYER_CFG.speed = 22.5;
+    PLAYER_CFG.swimSpeed = 11.0;
+  }
+
+  /**
+   * Camera with a far plane beyond the ring's physical extent, so box
+   * geometry is never clipped (fog and early ray termination hide the
+   * actual cutoff).
+   */
+  const camera = new PerspectiveCamera(50, 1.0, 0.1, RING_RADIUS + 200);
+  const player = createPlayer(
+    SPAWN[0],
+    getWorldHeight(blockGrid.blocks, SPAWN[0], SPAWN[2]) +
+      PLAYER_CFG.halfSize +
+      0.1,
+    SPAWN[2],
+  );
+  const playerCube = new Mesh(
+    new BoxGeometry(
+      PLAYER_CFG.halfSize * 2,
+      PLAYER_CFG.halfSize * 2,
+      PLAYER_CFG.halfSize * 2,
+    ),
+    playerMaterial,
+    //new MeshStandardMaterial({ color: 0xff7043, roughness: 0.8 }),
+  );
+  playerCube.position.copy(player.position);
+  scene.add(playerCube);
+  // Both renderers' translucent water passes (and the triangle renderer's
+  // underwater tint) blend over the opaque scene; scene-graph draw order
+  // means they must be added after the player cube.
+  rendererSwitch.addTranslucentPassesToScene(scene);
+  installKeyboardControls();
+  // OoT-style camera: owns look-drag, auto-turns the character, swings
+  // back behind the player when left alone. Replaces `placeCamera`.
+  const ootCam = createOotCamera((x, z) =>
+    getWorldHeight(blockGrid.blocks, x, z),
+  );
+  ootCam.snap(camera, player);
+  let timer: GpuTimer | undefined;
+  let hud: HTMLDivElement | undefined;
+  let sampleCounter = 0;
+
+  // --- adaptive render resolution -------------------------------------
+  /**
+   * A pure scaler fed this frame's render time. It steps the render
+   * resolution scale by roughly 1.25x per adjustment, so marginal devices
+   * converge on a stable scale instead of thrashing between 1x and 0.5x.
+   */
+  const adaptive = new AdaptiveResolution();
+  let baseW = 0;
+  let baseH = 0;
+  let lastAdaptT = 0;
+
+  const applyResolution = (scale: number) => {
+    const canvas = state.canvas;
+    if (canvas === undefined || baseW <= 0 || baseH <= 0) {
+      return;
+    }
+    const w = Math.max(1, Math.round(baseW * scale));
+    const h = Math.max(1, Math.round(baseH * scale));
+    if (w !== canvas.width || h !== canvas.height) {
+      canvas.width = w;
+      canvas.height = h;
+      // Resizing the canvas clears its drawing buffer to transparent, which
+      // would flash the page background until the next RAF frame. Draw the new
+      // resolution immediately so the compositor never shows the cleared buffer.
+      render();
+    }
+  };
+
+  /**
+   * Called once per frame after `render()`: feeds the frame time (in
+   * milliseconds) into the scaler and applies whatever scale it settles on.
+   * Readback frames are skipped from the decision (they stall the GPU) but
+   * still update the exponential moving average.
+   */
+  const adaptResolution = (t: number) => {
+    if (lastAdaptT > 0) {
+      const dt = t - lastAdaptT;
+      const next =
+        debugPerf && sampleCounter % SAMPLE_EVERY === 0
+          ? adaptive.frame(dt)
+          : adaptive.update(dt);
+      applyResolution(next);
+    }
+    lastAdaptT = t;
+  };
+
+  const updateHud = (ms: number, stats: string) => {
+    if (hud === undefined) {
+      return;
+    }
+    hud.textContent = `frame: ${ms.toFixed(2)} ms | res: ${adaptive.scale}x | ${stats}`;
+  };
+  let lastFrameT = 0;
+  /** Reusable color object, updated in place each frame so sky updates don't allocate. */
+  const skyColor = new Color(SKY_BLUE);
+  let animate = (t: number) => {
+    const dt =
+      lastFrameT > 0 ? Math.min(0.05, (t - lastFrameT) / 1000) : 1 / 60;
+    lastFrameT = t;
+    const input = consumeInput();
+    // Turn the character toward the stick (relative to the camera) and
+    // rewrite the stick into the player-relative frame the package expects.
+    ootCam.applyControls(player, dt, input);
+    updatePlayer(
+      player,
+      dt,
+      input,
+      (x, z) => getWorldHeight(blockGrid.blocks, x, z),
+      // water surface height: sea level where the ground dips below it, else none
+      (x, z) => {
+        const ground = getWorldHeight(blockGrid.blocks, x, z);
+        const sea = TERRAIN.seaLevel;
+        return sea !== undefined && ground < sea ? sea : -Infinity;
+      },
+      SAFE_EXTENT,
+    );
+    // scroll the terrain ring so the player's block stays centred
+    worldRing.scrollToPlayer(player.position.x, player.position.z);
+    playerCube.position.copy(player.position);
+    // the cube's local +Z faces the heading; a Y rotation by `yaw` aligns it
+    playerCube.rotation.y = player.yaw;
+    ootCam.update(camera, player, dt);
+    // advance the day-night clock and re-derive the scene lighting. A command
+    // override pins the shown time; otherwise the real clock (scaled by speed)
+    // drives the cycle.
+    const dn = dayNight.tick(dt, camera);
+    skyColor.set(dn.skyColor[0], dn.skyColor[1], dn.skyColor[2]);
+    state.renderer?.setClearColor(skyColor, 1);
+    rendererSwitch.applyLighting(dn);
+    // per-frame work specific to whichever renderer is active (mesh-build
+    // draining for the triangle renderer, underwater tint, etc.)
+    rendererSwitch.tick(dt, camera);
+    render();
+    adaptResolution(t);
+  };
+  createEffect(
+    () => state.canvas,
+    (canvas) => {
+      if (canvas === undefined) {
+        return;
+      }
+      let renderer = new WebGLRenderer(canvas);
+      renderer.setClearColor(SKY_BLUE, 1);
+      if (debugPerf) {
+        timer = new GpuTimer(renderer.gl);
+      }
+      setState((s) => {
+        s.renderer = renderer;
+      });
+      let resizeObserver = new ResizeObserver(() => {
+        let rect = canvas.getBoundingClientRect();
+        let aspect = rect.width / rect.height;
+        if (!Number.isFinite(aspect) || aspect <= 0) {
+          return;
+        }
+        baseW = rect.width * window.devicePixelRatio;
+        baseH = rect.height * window.devicePixelRatio;
+        camera.aspect = aspect;
+        camera.updateProjectionMatrix();
+        // a layout change changes the render cost, so hold adaptation while
+        // the new base resolution settles
+        adaptive.hold();
+        applyResolution(adaptive.scale);
+      });
+      resizeObserver.observe(canvas);
+      renderer.setAnimationLoop((t) => {
+        animate(t);
+      });
+      return () => {
+        resizeObserver.unobserve(canvas);
+        resizeObserver.disconnect();
+        renderer.setAnimationLoop(null);
+        // release the renderer's GPU programs, buffers and textures
+        renderer.dispose();
+        // stop the fill worker so it doesn't keep running after unmount
+        worldRing.dispose();
+      };
+    },
+  );
+  const render = () => {
+    let renderer = state.renderer;
+    if (renderer === undefined) {
+      return;
+    }
+    if (timer !== undefined) {
+      timer.begin();
+    }
+    renderer.render(scene, camera);
+    if (timer !== undefined) {
+      timer.end();
+      timer.poll();
+      sampleCounter++;
+      const sample = sampleCounter % SAMPLE_EVERY === 0;
+      updateHud(
+        timer.ms,
+        rendererSwitch.describeDebugStats(
+          renderer.gl,
+          renderer.canvas.width,
+          renderer.canvas.height,
+          sample,
+        ),
+      );
+    }
+  };
+  const lookDrag = createLookDragHandlers();
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: "100%",
+        height: "100%",
+      }}
+    >
+      <canvas
+        ref={(canvas) =>
+          setState((s) => {
+            s.canvas = canvas;
+          })
+        }
+        style={{
+          position: "absolute",
+          left: "0",
+          top: "0",
+          width: "100%",
+          height: "100%",
+          "touch-action": "none",
+        }}
+        onPointerDown={lookDrag.onPointerDown}
+        onPointerMove={lookDrag.onPointerMove}
+        onPointerUp={lookDrag.onPointerUp}
+        onPointerCancel={lookDrag.onPointerCancel}
+      />
+      <Controls />
+      <Console onCommand={(line) => commands.run(line)} />
+      {debugPerf && (
+        <div
+          ref={(el) => {
+            hud = el;
+          }}
+          style={{
+            position: "absolute",
+            left: "8px",
+            top: "8px",
+            padding: "4px 8px",
+            background: "rgba(0, 0, 0, 0.6)",
+            color: "#fff",
+            font: "12px monospace",
+            "border-radius": "4px",
+            "pointer-events": "none",
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+export default App;
