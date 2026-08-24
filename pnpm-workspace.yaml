@@ -2,4 +2,4 @@ allowBuilds:
   esbuild: true
 minimumReleaseAgeExclude:
   - '@random-mesh/rmsl@1.8.0'
-  - '@big-mesh-studios/bms-voxelscape@0.1.0 || 0.1.1 || 0.1.2'
+  - '@big-mesh-studios/bms-voxelscape@0.1.0 || 0.1.1 || 0.1.2 || 0.1.3'

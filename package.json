@@ -35,7 +35,7 @@
     "@solidjs/signals": "2.0.0-beta.29",
     "@solidjs/web": "2.0.0-beta.29",
     "@tailwindcss/vite": "^4.3.0",
-    "@big-mesh-studios/bms-voxelscape": "0.1.2",
+    "@big-mesh-studios/bms-voxelscape": "0.1.3",
     "browser-fs-access": "^0.38.0",
     "daisyui": "^5.5.20",
     "jszip": "^3.10.1",
