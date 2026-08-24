@@ -24,9 +24,12 @@ import {
   updatePlayer,
 } from "@big-mesh-studios/bms-voxelscape";
 import { RendererSwitch } from "@big-mesh-studios/bms-voxelscape";
+import { SoundController } from "@big-mesh-studios/bms-voxelscape";
 import { loadVoxelTiles } from "@big-mesh-studios/bms-voxelscape";
 import { Console } from "@big-mesh-studios/bms-voxelscape";
 import { Controls } from "@big-mesh-studios/bms-voxelscape";
+import { applyWeather } from "@big-mesh-studios/bms-voxelscape";
+import { WeatherController } from "@big-mesh-studios/bms-voxelscape";
 import { BlockGrid } from "@big-mesh-studios/bms-voxelscape";
 import {
   BLOCK_WORLD,
@@ -116,8 +119,6 @@ const App: Component<{}> = () => {
   const rendererSwitch = new RendererSwitch({
     scene,
     blocks: blockGrid.blocks,
-    gridCoordAt: (i) => blockGrid.gridCoordAt(i),
-    lookupBlock: (gx, gz) => blockGrid.lookupBlock(gx, gz),
     padding: PAD,
     blockWorld: BLOCK_WORLD,
     fogDistance: FOG_DISTANCE,
@@ -139,7 +140,6 @@ const App: Component<{}> = () => {
     onBlockReposition: (i, center) => rendererSwitch.repositionBlock(i, center),
   });
 
-  const commands = createDebugCommands({ dayNight, rendererSwitch });
   // Tell every block material which tile each voxel face uses once the
   // spritesheet loads. Fire-and-forget: voxels stay flat blue until it lands.
   loadVoxelTiles(rendererSwitch);
@@ -214,6 +214,38 @@ const App: Component<{}> = () => {
   // underwater tint) blend over the opaque scene; scene-graph draw order
   // means they must be added after the player cube.
   rendererSwitch.addTranslucentPassesToScene(scene);
+  /**
+   * Synthesizes the weather's sound (rain, wind, thunder) from the Web Audio
+   * API. Browsers suspend audio until the first user gesture, so `unlock` is
+   * bound to the first pointer/key event below.
+   */
+  const sound = new SoundController();
+  const unlockSound = (): void => {
+    sound.unlock();
+    window.removeEventListener("pointerdown", unlockSound);
+    window.removeEventListener("keydown", unlockSound);
+  };
+  window.addEventListener("pointerdown", unlockSound);
+  window.addEventListener("keydown", unlockSound);
+  /**
+   * Owns the rain/snow particle systems, the thunder lightning bolts, and the
+   * strike flash. Added to the scene after the translucent passes so the
+   * weather draws over terrain and water; `tick` returns the current weather
+   * so `applyWeather` can tint the day-night state before it reaches the
+   * renderers and the clear colour. Lightning strikes are reported to the
+   * sound controller so thunder can follow the flashes.
+   */
+  const weather = new WeatherController({
+    scene,
+    groundHeight: (x, z) => getWorldHeight(blockGrid.blocks, x, z),
+    onStrike: (x, z) => sound.thunderStrike(x, z),
+  });
+  const commands = createDebugCommands({
+    dayNight,
+    rendererSwitch,
+    weather,
+    sound,
+  });
   installKeyboardControls();
   // OoT-style camera: owns look-drag, auto-turns the character, swings
   // back behind the player when left alone. Replaces `placeCamera`.
@@ -309,11 +341,16 @@ const App: Component<{}> = () => {
     ootCam.update(camera, player, dt);
     // advance the day-night clock and re-derive the scene lighting. A command
     // override pins the shown time; otherwise the real clock (scaled by speed)
-    // drives the cycle.
+    // drives the cycle. The weather schedule keys off the same shown clock
+    // seconds, and its intensity then tints the day-night state before it
+    // reaches the renderers and the clear colour.
     const dn = dayNight.tick(dt, camera);
-    skyColor.set(dn.skyColor[0], dn.skyColor[1], dn.skyColor[2]);
+    const weatherView = weather.tick(dt, camera, dn.elapsed);
+    sound.tick(dt, camera, weatherView);
+    const env = applyWeather(dn, weatherView.weather, weatherView.intensity);
+    skyColor.set(env.skyColor[0], env.skyColor[1], env.skyColor[2]);
     state.renderer?.setClearColor(skyColor, 1);
-    rendererSwitch.applyLighting(dn);
+    rendererSwitch.applyLighting(env);
     // per-frame work specific to whichever renderer is active (mesh-build
     // draining for the triangle renderer, underwater tint, etc.)
     rendererSwitch.tick(dt, camera);
@@ -361,6 +398,10 @@ const App: Component<{}> = () => {
         renderer.dispose();
         // stop the fill worker so it doesn't keep running after unmount
         worldRing.dispose();
+        // release the audio hardware
+        sound.dispose();
+        window.removeEventListener("pointerdown", unlockSound);
+        window.removeEventListener("keydown", unlockSound);
       };
     },
   );
